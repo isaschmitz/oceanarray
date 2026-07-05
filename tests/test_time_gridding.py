@@ -1,5 +1,4 @@
-"""
-Tests for oceanarray.time_gridding module.
+"""Tests for oceanarray.time_gridding module.
 
 Tests cover Step 1: time gridding and optional filtering of multiple instruments.
 
@@ -21,9 +20,11 @@ import pytest
 import xarray as xr
 import yaml
 
-from oceanarray.time_gridding import (TimeGriddingProcessor,
-                                      process_multiple_moorings_time_gridding,
-                                      time_gridding_mooring)
+from oceanarray.time_gridding import (
+    TimeGriddingProcessor,
+    process_multiple_moorings_time_gridding,
+    time_gridding_mooring,
+)
 
 
 def create_mock_instrument_dataset(
@@ -149,7 +150,7 @@ class TestTimeGriddingProcessor:
         # Create dataset missing some metadata
         ds = xr.Dataset(
             {"temperature": (["time"], [20.0, 20.1])},
-            coords={"time": pd.date_range("2018-01-01", periods=2, freq="H")},
+            coords={"time": pd.date_range("2018-01-01", periods=2, freq="h")},
         )
 
         instrument_config = {
@@ -174,7 +175,7 @@ class TestTimeGriddingProcessor:
                 "density": (["time"], [1025.0, 1025.1]),
                 "potential_temperature": (["time"], [19.9, 20.0]),
             },
-            coords={"time": pd.date_range("2018-01-01", periods=2, freq="H")},
+            coords={"time": pd.date_range("2018-01-01", periods=2, freq="h")},
         )
 
         result = processor._clean_dataset_variables(ds)
@@ -343,7 +344,7 @@ class TestTimeGriddingProcessor:
         ds = xr.Dataset(
             {"temperature": (["time", "N_LEVELS"], np.random.random((10, 3)))},
             coords={
-                "time": pd.date_range("2018-01-01", periods=10, freq="H"),
+                "time": pd.date_range("2018-01-01", periods=10, freq="h"),
                 "N_LEVELS": np.arange(3),
                 "instrument": ("N_LEVELS", ["microcat", "adcp", "microcat"]),
             },
