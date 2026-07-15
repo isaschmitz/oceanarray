@@ -30,7 +30,18 @@ class TestMooringProcessor:
     @pytest.fixture
     def processor(self, temp_dir):
         """Create a MooringProcessor instance for testing."""
-        return MooringProcessor(str(temp_dir))
+        import logging
+
+        p = MooringProcessor(str(temp_dir))
+        yield p
+        # Close any FileHandlers added to library loggers by _setup_logging so
+        # Windows can delete the temp directory when the fixture tears down.
+        for name in ("seasenselib", "pycnv"):
+            log = logging.getLogger(name)
+            for h in list(log.handlers):
+                if isinstance(h, logging.FileHandler):
+                    h.close()
+                    log.removeHandler(h)
 
     @pytest.fixture
     def sample_yaml_data(self):
@@ -70,7 +81,14 @@ class TestMooringProcessor:
     def test_supported_file_types_completeness(self):
         """Test that SUPPORTED_FILE_TYPES contains expected format keys for seasenselib.read()."""
         processor = MooringProcessor("/tmp")
-        expected_types = ["sbe-cnv", "nortek-aqd", "sbe-asc", "rbr-rsk", "rbr-dat"]
+        expected_types = [
+            "sbe-cnv",
+            "sbe-asc",
+            "sbe-ascii",
+            "nortek-aqd",
+            "rbr-rsk",
+            "rbr-dat",
+        ]
         for file_type in expected_types:
             assert file_type in processor.SUPPORTED_FILE_TYPES
 
@@ -131,7 +149,7 @@ class TestMooringProcessor:
         filename = processor._generate_output_filename(
             "test_mooring", instrument_config, output_dir
         )
-        expected = output_dir / "test_mooring_7518_raw.nc"
+        expected = output_dir / "test_mooring_7518_stage1.nc"
         assert filename == expected
 
     def test_get_netcdf_writer_params(self, processor):
@@ -295,8 +313,11 @@ class TestRealDataProcessing:
         """Set up test environment with real CNV data."""
         base_dir = tmp_path / "test_data"
 
-        # Create directory structure
-        raw_dir = base_dir / "moor" / "raw" / "test_deployment" / "microcat"
+        # Create directory structure matching real layout:
+        # input_dir / instrument / mooring_name / filename
+        raw_dir = (
+            base_dir / "moor" / "raw" / "test_deployment" / "microcat" / "test_mooring"
+        )
         proc_dir = base_dir / "moor" / "proc" / "test_mooring"
         raw_dir.mkdir(parents=True)
         proc_dir.mkdir(parents=True)
@@ -362,7 +383,7 @@ class TestRealDataProcessing:
         assert result is True
 
         # Check that output file was created
-        output_file = setup["proc_dir"] / "microcat" / "test_mooring_7518_raw.nc"
+        output_file = setup["proc_dir"] / "microcat" / "test_mooring_7518_stage1.nc"
         assert output_file.exists()
 
         # Check that we can open and validate the NetCDF file
