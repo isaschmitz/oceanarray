@@ -54,6 +54,234 @@ import yaml
 
 HAB_THRESHOLD = 2.0  # metres — use near-neighbour below this Δhab
 
+
+# ---------------------------------------------------------------------------
+# BEAM → ENU coordinate transform helpers
+# ---------------------------------------------------------------------------
+
+
+def _xyz_to_enu(
+    vx: np.ndarray,
+    vy: np.ndarray,
+    vz: np.ndarray,
+    heading_deg: np.ndarray,
+    pitch_deg: np.ndarray,
+    roll_deg: np.ndarray,
+    declination_deg: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised XYZ → ENU rotation per Nortek Support reference script.
+
+    R = H @ P where (with hdg = heading - 90 + declination):
+      H = [[cos(hdg), sin(hdg), 0], [-sin(hdg), cos(hdg), 0], [0, 0, 1]]
+      P = [[cos(p), -sin(p)*sin(r), -cos(r)*sin(p)],
+           [0,       cos(r),        -sin(r)],
+           [sin(p),  sin(r)*cos(p),  cos(p)*cos(r)]]
+
+    The -90 offset accounts for the Nortek Aquadopp instrument frame where
+    heading=90° aligns X→East, Y→North (standard geography at zero tilt).
+    Magnetic declination is added to convert magnetic heading to true north.
+
+    Returns (east, north, up) arrays of the same shape as the inputs.
+    """
+    h = np.radians(heading_deg - 90.0 + declination_deg)
+    p = np.radians(pitch_deg)
+    r = np.radians(roll_deg)
+
+    ch = np.cos(h)
+    sh = np.sin(h)
+    cp = np.cos(p)
+    sp = np.sin(p)
+    cr = np.cos(r)
+    sr = np.sin(r)
+
+    # Expanded R = H @ P (verified against Nortek Support reference script)
+    east = (
+        ch * cp * vx + (-ch * sp * sr + sh * cr) * vy + (-ch * sp * cr - sh * sr) * vz
+    )
+    north = (
+        -sh * cp * vx + (sh * sp * sr + ch * cr) * vy + (sh * sp * cr - ch * sr) * vz
+    )
+    up = sp * vx + sr * cp * vy + cp * cr * vz
+    return east, north, up
+
+
+def _apply_beam_to_enu(
+    ds: "xr.Dataset",
+    entry: Dict[str, Any],
+    lat: float,
+    lon: float,
+    log_fn=None,
+) -> "xr.Dataset":
+    """Transform BEAM or XYZ Nortek velocities to ENU geographic coordinates.
+
+    Adds east_velocity, north_velocity, up_velocity, current_speed,
+    current_direction.  Updates nortek_coordinate_system attr to 'ENU'.
+    No-ops for instruments already in ENU or with unknown coordinate system.
+    Requires normalized variable names (heading, pitch, roll) — re-run stage1
+    if these are absent.
+    """
+
+    def _warn(msg):
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg)
+
+    coord_sys = ds.attrs.get("nortek_coordinate_system", "ENU")
+    if coord_sys not in ("BEAM", "XYZ"):
+        return ds
+
+    # Require normalized heading/pitch/roll (stage1 normalization must have run)
+    for vname in ("heading", "pitch", "roll"):
+        if vname not in ds.data_vars:
+            _warn(
+                f"  WARNING: BEAM→ENU skipped — '{vname}' not in dataset. "
+                "Re-run stage1 to get normalized variable names."
+            )
+            return ds
+
+    heading = ds["heading"].values.astype(float)
+    pitch = ds["pitch"].values.astype(float)
+    roll = ds["roll"].values.astype(float)
+
+    # Magnetic declination via ppigrf
+    declination = 0.0
+    try:
+        import ppigrf
+        import datetime as _dt
+
+        time_vals = ds["time"].values
+        t_mid = time_vals[len(time_vals) // 2]
+        t_mid_s = int(t_mid.astype("datetime64[s]").astype("int64"))
+        t_mid_dt = _dt.datetime.utcfromtimestamp(t_mid_s)
+        Be, Bn, _ = ppigrf.igrf(float(lon), float(lat), 0.0, t_mid_dt)
+        declination = float(
+            np.degrees(
+                np.arctan2(float(np.atleast_1d(Be)[0]), float(np.atleast_1d(Bn)[0]))
+            )
+        )
+        ds.attrs["magnetic_declination"] = declination
+        ds.attrs["magnetic_declination_units"] = "degrees_east"
+        ds.attrs["magnetic_declination_method"] = "ppigrf IGRF at deployment midpoint"
+        _warn(f"  BEAM→ENU: magnetic declination = {declination:.2f}°")
+    except Exception as e:
+        _warn(f"  WARNING: magnetic declination unavailable ({e}) — using 0°")
+
+    if coord_sys == "BEAM":
+        # Stage1 could not apply the T matrix (header file missing or unparseable).
+        # Re-run stage1 with the correct header file to produce velocity_x/y/z.
+        _warn(
+            f"  SKIPPING BEAM→ENU for serial {entry.get('serial', '?')}: "
+            "data are still in BEAM coordinates — re-run stage1 with the instrument "
+            "header file so the T matrix can be extracted and velocity_x/y/z produced."
+        )
+        return ds
+    else:  # XYZ — BEAM→XYZ already applied by stage1 (velocity_x/y/z) or natively XYZ
+        T_source = "N/A (already XYZ)"
+        if "velocity_x" in ds.data_vars:
+            # New path: stage1 applied T matrix and stored instrument-frame XYZ
+            vx = ds["velocity_x"].values.astype(float)
+            vy = ds["velocity_y"].values.astype(float)
+            vz = ds["velocity_z"].values.astype(float)
+        elif "x_velocity" in ds.data_vars:
+            # Seasenselib naming for instruments that natively report XYZ
+            vx = ds["x_velocity"].values.astype(float)
+            vy = ds["y_velocity"].values.astype(float)
+            vz = ds["z_velocity"].values.astype(float)
+        else:
+            # Legacy fallback: XYZ stored in beam variable slots
+            vx = ds["velocity_beam1"].values.astype(float)
+            vy = ds["velocity_beam2"].values.astype(float)
+            vz = ds["velocity_beam3"].values.astype(float)
+
+    # XYZ → ENU
+    valid_all = (
+        np.isfinite(vx)
+        & np.isfinite(vy)
+        & np.isfinite(vz)
+        & np.isfinite(heading)
+        & np.isfinite(pitch)
+        & np.isfinite(roll)
+    )
+    east = np.full_like(vx, np.nan)
+    north = np.full_like(vx, np.nan)
+    up = np.full_like(vx, np.nan)
+    if valid_all.any():
+        east[valid_all], north[valid_all], up[valid_all] = _xyz_to_enu(
+            vx[valid_all],
+            vy[valid_all],
+            vz[valid_all],
+            heading[valid_all],
+            pitch[valid_all],
+            roll[valid_all],
+            declination,
+        )
+
+    speed = np.where(
+        np.isfinite(east) & np.isfinite(north), np.sqrt(east**2 + north**2), np.nan
+    )
+    direction = np.where(
+        np.isfinite(east) & np.isfinite(north),
+        np.degrees(np.arctan2(east, north)) % 360.0,
+        np.nan,
+    )
+
+    time_dim = ds["heading"].dims[0]
+    for name, arr, cf, units, long_name in [
+        (
+            "east_velocity",
+            east,
+            "eastward_sea_water_velocity",
+            "m s-1",
+            "Eastward sea water velocity",
+        ),
+        (
+            "north_velocity",
+            north,
+            "northward_sea_water_velocity",
+            "m s-1",
+            "Northward sea water velocity",
+        ),
+        (
+            "up_velocity",
+            up,
+            "upward_sea_water_velocity",
+            "m s-1",
+            "Upward sea water velocity",
+        ),
+        (
+            "current_speed",
+            speed,
+            "sea_water_speed",
+            "m s-1",
+            "Horizontal current speed",
+        ),
+        (
+            "current_direction",
+            direction,
+            "direction_of_sea_water_velocity",
+            "degrees",
+            "Current direction (0=N, clockwise)",
+        ),
+    ]:
+        ds[name] = xr.Variable(
+            time_dim,
+            arr,
+            attrs={"units": units, "standard_name": cf, "long_name": long_name},
+        )
+
+    ds.attrs["nortek_coordinate_system"] = "ENU"
+    ds.attrs["nortek_coordinate_system_source"] = (
+        f"rotated from {coord_sys} by oceanarray stage3"
+    )
+    _t_str = T_source if coord_sys == "BEAM" else "N/A (XYZ mode)"
+    _warn(
+        f"  BEAM→ENU: produced east/north/up_velocity, current_speed, current_direction "
+        f"(coord_sys was {coord_sys}, T matrix: {_t_str})"
+    )
+    return ds
+
+
 # Priority order for merging QC flags (higher priority = worse data quality).
 # 9=missing, 4=bad, 3=suspect, 8=interpolated, 2=prob-good, 1=good
 _QC_PRIORITY: Dict[int, int] = {9: 6, 4: 5, 3: 4, 8: 3, 2: 2, 1: 1, 0: 0}
@@ -134,6 +362,25 @@ def _deep_merge(base: Dict, override: Dict) -> Dict:
     return merged
 
 
+def _tilt_from_span(qc_ranges: Dict[str, Any]) -> Dict[str, float]:
+    """Extract tilt thresholds from a qc_ranges block if 'tilt' is present.
+
+    Converts the symmetric span format (matching all other variables) into the
+    threshold format used internally by _apply_tilt_qc.  The upper bound of
+    each span is the threshold — tilt is always non-negative so the lower bound
+    is typically negative and only the upper bound matters:
+        suspect_span: [-20, 20]  →  suspect_threshold: 20
+        fail_span:    [-30, 30]  →  fail_threshold:    30
+    """
+    out: Dict[str, float] = {}
+    tilt_cfg = qc_ranges.get("tilt", {})
+    if "suspect_span" in tilt_cfg:
+        out["suspect_threshold"] = float(tilt_cfg["suspect_span"][1])
+    if "fail_span" in tilt_cfg:
+        out["fail_threshold"] = float(tilt_cfg["fail_span"][1])
+    return out
+
+
 def _load_qc_config(
     mooring_cfg: Dict[str, Any],
     entry: Dict[str, Any],
@@ -141,6 +388,13 @@ def _load_qc_config(
     """Return (gross_range, spike, tilt) configs for one instrument.
 
     Precedence: package defaults → mooring YAML → instrument YAML entry.
+
+    Tilt thresholds can be set either via the unified ``qc_ranges`` key
+    (using ``fail_span``/``suspect_span`` like all other variables) or via
+    the legacy ``tilt_qc`` key.  ``tilt_qc`` takes precedence over
+    ``qc_ranges.tilt`` at the same level.  Either way, ``tilt`` is stripped
+    from the gross-range dict so it is not passed to the QARTOD gross-range
+    test runner.
     """
     from . import parameters as P
 
@@ -151,6 +405,7 @@ def _load_qc_config(
     # Mooring-level overrides
     if "qc_ranges" in mooring_cfg:
         gr = _deep_merge(gr, mooring_cfg["qc_ranges"])
+        tilt.update(_tilt_from_span(mooring_cfg["qc_ranges"]))
     if "qc_spike" in mooring_cfg:
         sp = _deep_merge(sp, mooring_cfg["qc_spike"])
     if "tilt_qc" in mooring_cfg:
@@ -159,10 +414,15 @@ def _load_qc_config(
     # Instrument-level overrides
     if "qc_ranges" in entry:
         gr = _deep_merge(gr, entry["qc_ranges"])
+        tilt.update(_tilt_from_span(entry["qc_ranges"]))
     if "qc_spike" in entry:
         sp = _deep_merge(sp, entry["qc_spike"])
     if "tilt_qc" in entry:
         tilt.update(entry["tilt_qc"])
+
+    # Remove tilt from the gross-range dict — it is handled separately and
+    # is not a valid QARTOD gross-range variable.
+    gr.pop("tilt", None)
 
     return gr, sp, tilt
 
@@ -183,34 +443,56 @@ def _apply_tilt_qc(
     tilt_cfg: Dict[str, Any],
     qc_attrs: Dict[str, Any],
 ) -> tuple[xr.Dataset, int, int]:
-    """Flag velocity variables when |roll| exceeds tilt thresholds.
+    """Flag velocity variables when instrument tilt exceeds thresholds.
 
-    Flag 3 (suspect) for suspect_threshold ≤ |roll| < fail_threshold.
-    Flag 4 (bad)     for |roll| ≥ fail_threshold.
+    Tilt is computed from pitch and roll as:
+        tilt = arccos(cos(pitch) × cos(roll))
+    which collapses to |roll| when pitch=0 and |pitch| when roll=0.
 
-    Returns (ds, n_suspect, n_bad).  No-ops when roll is absent.
+    Flag 3 (suspect) for suspect_threshold ≤ tilt < fail_threshold.
+    Flag 4 (bad)     for tilt ≥ fail_threshold.
+    Flag 9 (missing) when pitch or roll is NaN.
+
+    Returns (ds, n_suspect, n_bad).  No-ops when both pitch and roll are absent.
     """
-    if "roll" not in ds.data_vars:
+    has_pitch = "pitch" in ds.data_vars
+    has_roll = "roll" in ds.data_vars
+    if not has_pitch and not has_roll:
         return ds, 0, 0
 
-    roll = ds["roll"].values.astype(float)
-    abs_roll = np.abs(roll)
+    n_time = ds["time"].size
+    pitch = ds["pitch"].values.astype(float) if has_pitch else np.zeros(n_time)
+    roll = ds["roll"].values.astype(float) if has_roll else np.zeros(n_time)
+
+    cos_tilt = np.cos(np.radians(pitch)) * np.cos(np.radians(roll))
+    tilt = np.degrees(np.arccos(np.clip(cos_tilt, -1.0, 1.0)))
+    # Propagate NaN from either sensor
+    tilt[~np.isfinite(pitch) | ~np.isfinite(roll)] = np.nan
 
     suspect_thresh = float(tilt_cfg.get("suspect_threshold", 20.0))
     fail_thresh = float(tilt_cfg.get("fail_threshold", 30.0))
 
+    # If either axis exceeds ±90° the instrument is beyond horizontal.
+    # The arccos formula can give misleadingly small tilt in this case
+    # (both cosines negative → positive product → small angle), so force flag 4.
+    beyond_horizontal = (np.abs(pitch) > 90.0) | (np.abs(roll) > 90.0)
+
     tilt_flags = np.where(
-        ~np.isfinite(abs_roll),
+        ~np.isfinite(tilt),
         np.int8(9),
         np.where(
-            abs_roll >= fail_thresh,
+            beyond_horizontal | (tilt >= fail_thresh),
             np.int8(4),
-            np.where(abs_roll >= suspect_thresh, np.int8(3), np.int8(1)),
+            np.where(tilt >= suspect_thresh, np.int8(3), np.int8(1)),
         ),
     ).astype(np.int8)
 
     n_suspect = int(np.sum(tilt_flags == 3))
     n_bad = int(np.sum(tilt_flags == 4))
+
+    # Persist thresholds in global attrs so the report can draw correct lines.
+    ds.attrs["tilt_suspect_threshold"] = suspect_thresh
+    ds.attrs["tilt_fail_threshold"] = fail_thresh
 
     if n_suspect == 0 and n_bad == 0:
         return ds, 0, 0
@@ -438,6 +720,42 @@ def _apply_qc_tests(
     return ds
 
 
+def _apply_enu_velocity_qc(
+    ds: xr.Dataset,
+    gr_cfg: Dict[str, Any],
+    qc_attrs: Dict[str, Any],
+) -> xr.Dataset:
+    """Apply QARTOD gross-range QC to ENU velocity vars and propagate w flags.
+
+    Must be called after _apply_beam_to_enu (east/north/up_velocity must exist).
+    No spike test is applied to velocity (burst-mode Aquadopps generate false
+    positives at every burst boundary).
+
+    Propagates up_velocity_qc (flag 3 or 4) to east_velocity_qc and
+    north_velocity_qc: if vertical velocity is implausibly large the whole
+    3-D velocity measurement is suspect/bad.
+    """
+    enu_gr = {
+        k: v
+        for k, v in gr_cfg.items()
+        if k in ("east_velocity", "north_velocity", "up_velocity")
+    }
+    if enu_gr:
+        ds = _apply_qc_tests(ds, enu_gr, {}, qc_attrs)
+
+    if "up_velocity_qc" in ds.data_vars:
+        up_flags = ds["up_velocity_qc"].values.astype(np.int8)
+        for vel_var in ("east_velocity", "north_velocity"):
+            qc_varname = f"{vel_var}_qc"
+            if qc_varname in ds.data_vars:
+                existing = ds[qc_varname].values.astype(np.int8)
+                merged = _merge_flags(existing, up_flags)
+                ds[qc_varname] = xr.Variable(
+                    ds[vel_var].dims, merged, attrs=dict(ds[qc_varname].attrs)
+                )
+    return ds
+
+
 class Stage3Processor:
     """Pressure interpolation + QARTOD QC for all mooring instruments."""
 
@@ -495,6 +813,11 @@ class Stage3Processor:
             "clamp", mooring_config.get("instruments", [])
         )
 
+        # ── Mooring location for BEAM→ENU declination ──────────────────
+        from .mooring_level import _parse_latlon
+
+        _mooring_lat, _mooring_lon = _parse_latlon(mooring_config)
+
         # ── Build instrument table ──────────────────────────────────────
         instruments: List[Dict[str, Any]] = []
         for entry in instrument_list:
@@ -526,6 +849,8 @@ class Stage3Processor:
                     "spike": sp_cfg,
                     "tilt": tilt_cfg,
                     "entry": entry,
+                    "lat": _mooring_lat,
+                    "lon": _mooring_lon,
                 }
             )
 
@@ -712,14 +1037,43 @@ class Stage3Processor:
             # ── Fold T/C/P parent QC into salinity_qc ─────────────────
             ds = _merge_salinity_parent_qc(ds, qc_attrs)
 
-            # ── Tilt QC (Aquadopp pitch-based flagging) ────────────────
+            # ── BEAM / XYZ → ENU coordinate transform ─────────────────
+            # Must run before tilt QC so east/north/up_velocity exist to be flagged.
+            coord_sys_before = ds.attrs.get("nortek_coordinate_system", "ENU")
+            ds = _apply_beam_to_enu(
+                ds, info["entry"], info["lat"], info["lon"], log_fn=self._log
+            )
+
+            # ── ENU velocity QC + up→east/north flag propagation ──────
+            # Run gross-range on ENU vars just created by _apply_beam_to_enu,
+            # then propagate up_velocity_qc so bad w flags u and v too.
+            if ds.attrs.get("nortek_coordinate_system") == "ENU":
+                ds = _apply_enu_velocity_qc(ds, gr_cfg, qc_attrs)
+
+            # ── Tilt QC ────────────────────────────────────────────────
+            # Flags all velocity variables (beam and ENU) when combined
+            # pitch+roll tilt exceeds threshold.
             tilt_cfg = info["tilt"]
             ds, n_tilt_susp, n_tilt_bad = _apply_tilt_qc(ds, tilt_cfg, qc_attrs)
             if n_tilt_susp or n_tilt_bad:
                 history_notes.append(
-                    f"tilt QC (|roll|≥{tilt_cfg['suspect_threshold']}°→suspect, "
-                    f"|roll|≥{tilt_cfg['fail_threshold']}°→bad): "
+                    f"tilt QC (tilt≥{tilt_cfg['suspect_threshold']}°→suspect, "
+                    f"tilt≥{tilt_cfg['fail_threshold']}°→bad): "
                     f"suspect={n_tilt_susp}, bad={n_tilt_bad}"
+                )
+            if (
+                ds.attrs.get("nortek_coordinate_system") == "ENU"
+                and coord_sys_before != "ENU"
+            ):
+                _ba = ds.attrs.get("nortek_beam_angle", "?")
+                _ba_src = ds.attrs.get("nortek_beam_angle_source", "")
+                _assumed = "ASSUMED DEFAULT" in _ba_src
+                history_notes.append(
+                    f"BEAM→ENU rotation applied: "
+                    f"beam_angle={_ba}° "
+                    f"({'ASSUMED DEFAULT — not from datasheet' if _assumed else 'from YAML'}), "
+                    f"declination={ds.attrs.get('magnetic_declination', 0.0):.2f}° "
+                    f"({'ppigrf IGRF' if 'magnetic_declination' in ds.attrs else 'assumed 0'})"
                 )
 
             # Report which variables got QC flags and their flag counts

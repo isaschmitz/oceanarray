@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
+from .utilities import _nice_colorbar_bounds, _status
 
 
 # ---------------------------------------------------------------------------
@@ -271,12 +272,17 @@ _CANONICAL_PANELS: List[Tuple] = [
     ("velocity_beam1", "Beam 1 vel. [m/s]", "tab:blue", False),
     ("velocity_beam2", "Beam 2 vel. [m/s]", "tab:orange", False),
     ("velocity_beam3", "Beam 3 vel. [m/s]", "tab:cyan", False),
+    ("tilt", "Tilt [°]", "tab:red", False),
     ("pitch", "Pitch [°]", "tab:purple", False),
     ("roll", "Roll [°]", "#8B4513", False),
     ("heading", "Heading [°]", "tab:gray", False),
     ("speed_of_sound", "Sound speed [m/s]", "tab:olive", False),
     ("battery_voltage", "Battery [V]", "tab:pink", False),
 ]
+
+# Variables that get a shorter panel height (less important diagnostics)
+_COMPACT_PANEL_VARS: frozenset = frozenset({"battery_voltage", "speed_of_sound"})
+_COMPACT_PANEL_HEIGHT: float = 1.5  # units relative to the normal 3.0
 
 
 def _instrument_panels(ds) -> List[Tuple]:
@@ -290,9 +296,19 @@ def _instrument_panels(ds) -> List[Tuple]:
     import re as _re
 
     time_vars = {v for v in ds.data_vars if ds[v].dims == ("time",)}
+
+    # Suppress raw beam velocities when ENU velocities are present — the
+    # transformed components are more useful and the beams are redundant.
+    has_enu = any(
+        v in time_vars for v in ("east_velocity", "north_velocity", "up_velocity")
+    )
+    beam_vars = {"velocity_beam1", "velocity_beam2", "velocity_beam3"}
+
     out = []
     for vname, label, color, invert in _CANONICAL_PANELS:
         if vname not in time_vars:
+            continue
+        if has_enu and vname in beam_vars:
             continue
         actual_units = ds[vname].attrs.get("units", "")
         if actual_units:
@@ -313,12 +329,50 @@ def _build_fig_from_ds(
     from . import parameters as P
 
     plt.style.use(str(P.MPLSTYLE))
+
+    # Inject tilt as a computed variable so it appears in panels if pitch/roll present
+    _has_pitch = "pitch" in ds.data_vars
+    _has_roll = "roll" in ds.data_vars
+    if _has_pitch or _has_roll:
+        _n = ds.sizes["time"]
+        _pitch_r = (
+            np.radians(ds["pitch"].values.astype(float)) if _has_pitch else np.zeros(_n)
+        )
+        _roll_r = (
+            np.radians(ds["roll"].values.astype(float)) if _has_roll else np.zeros(_n)
+        )
+        _cos_t = np.cos(_pitch_r) * np.cos(_roll_r)
+        _tilt = np.degrees(np.arccos(np.clip(_cos_t, -1.0, 1.0)))
+        if _has_pitch:
+            _tilt[~np.isfinite(ds["pitch"].values.astype(float))] = np.nan
+        if _has_roll:
+            _tilt[~np.isfinite(ds["roll"].values.astype(float))] = np.nan
+        import xarray as _xr
+
+        ds = ds.assign(
+            tilt=_xr.Variable(
+                "time",
+                _tilt,
+                {"units": "degrees", "long_name": "Instrument tilt from vertical"},
+            )
+        )
+
     panels = _instrument_panels(ds)
     if not panels:
         return None
 
     nrows = len(panels)
-    fig, axs = plt.subplots(nrows, 1, figsize=(12, 3 * nrows), sharex=True)
+    height_ratios = [
+        _COMPACT_PANEL_HEIGHT if vname in _COMPACT_PANEL_VARS else 3.0
+        for vname, *_ in panels
+    ]
+    fig, axs = plt.subplots(
+        nrows,
+        1,
+        figsize=(12, sum(height_ratios)),
+        gridspec_kw={"height_ratios": height_ratios},
+        sharex=True,
+    )
     if nrows == 1:
         axs = [axs]
 
@@ -334,6 +388,26 @@ def _build_fig_from_ds(
         ax.plot(time, data, color=color, linewidth=0.6, zorder=1)
         if "velocity" in vname and not invert:
             ax.axhline(0, color="k", linewidth=0.4, linestyle="--", zorder=0)
+        if vname == "tilt":
+            _suspect_t = float(ds.attrs.get("tilt_suspect_threshold", 20.0))
+            _fail_t = float(ds.attrs.get("tilt_fail_threshold", 30.0))
+            ax.axhline(
+                _suspect_t,
+                color="tab:orange",
+                lw=0.9,
+                ls="--",
+                label=f"suspect {_suspect_t:.0f}°",
+                zorder=2,
+            )
+            ax.axhline(
+                _fail_t,
+                color="tab:red",
+                lw=0.9,
+                ls="--",
+                label=f"fail {_fail_t:.0f}°",
+                zorder=2,
+            )
+            ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
         ax.set_ylabel(label, fontsize=9)
         if invert:
             vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
@@ -754,6 +828,11 @@ def _read_nc_metadata(nc_path: Path) -> Dict[str, Any]:
             else:
                 info["dims"] = ", ".join(str(d) for d in v.dims)
                 info["n"] = v.shape[0] if v.shape else 0
+                arr = v.values
+                if arr.dtype.kind in ("f", "c"):
+                    info["n_valid"] = int(np.sum(np.isfinite(arr)))
+                else:
+                    info["n_valid"] = int(arr.size)
                 info["has_qc"] = f"{vname}_qc" in qc_vars
                 info["is_qc"] = vname in qc_vars
                 time_vars.append(info)
@@ -1004,6 +1083,7 @@ _HTML_TEMPLATE = """\
   .b-warn { background: var(--warn);   color: #fff; }
   .b-miss { background: #dfe6e9; color: #999; }
   .b-stack { background: var(--interp); color: #fff; }
+  .b-grid  { background: #8e44ad;       color: #fff; }
   .arrow { color: #ccc; font-size: 0.8rem; margin: 0 0.05rem; }
   /* clock table */
   .none-note { color: var(--muted); font-style: italic; }
@@ -1033,6 +1113,11 @@ _HTML_TEMPLATE = """\
 <div class="masthead">
   <h1>{{ mooring_name }}</h1>
   <p class="sub">Mooring recovery report &mdash; generated {{ generated }}</p>
+  {% if stack_exists or grid_exists %}<p class="sub" style="margin-top:0.2rem">
+    {% if stack_exists %}<a href="{{ mooring_name }}_stack_report.html" style="color:#aee;font-weight:600">&#8594; Stack report</a>{% endif %}
+    {% if stack_exists and grid_exists %} &bull; {% endif %}
+    {% if grid_exists %}<a href="{{ mooring_name }}_grid_report.html" style="color:#aee;font-weight:600">&#8594; Grid report</a>{% endif %}
+  </p>{% endif %}
   <dl class="meta-grid">
     <div><dt>Cruise</dt><dd>{{ cruise }}</dd></div>
     <div><dt>Ship</dt><dd>{{ ship }}</dd></div>
@@ -1051,7 +1136,8 @@ _HTML_TEMPLATE = """\
   Raw = file present in raw directory &bull;
   Read = format check passed &bull;
   Stage&nbsp;1–3 = processed NetCDF files exist &bull;
-  Stack = mooring-level <code>_stack.nc</code>
+  Stack = mooring-level <code>_stack.nc</code> &bull;
+  Grid = pressure-gridded <code>_grid.nc</code>
 </p>
 <table>
   <thead>
@@ -1121,6 +1207,13 @@ _HTML_TEMPLATE = """\
             <span class="badge b-stack">Stack ✓</span>
           {% else %}
             <span class="badge b-miss">Stack ○</span>
+          {% endif %}
+          <span class="arrow">›</span>
+          {# grid — same for all instruments #}
+          {% if grid_exists %}
+            <span class="badge b-grid">Grid ✓</span>
+          {% else %}
+            <span class="badge b-miss">Grid ○</span>
           {% endif %}
         </div>
       </td>
@@ -1432,6 +1525,882 @@ _HTML_TEMPLATE = """\
 """
 
 # ---------------------------------------------------------------------------
+# Grid report helpers and template
+# ---------------------------------------------------------------------------
+
+
+def _make_spectrum_fig_b64(
+    da_temp: "xr.DataArray",
+    dt_seconds: float,
+    lat: float = 0.0,
+) -> Optional[str]:
+    """Welch PSD of gridded temperature, one line per depth level coloured by pressure.
+
+    x-axis: period (days, log scale, long period on left).
+    y-axis: PSD (°C² cpd⁻¹, log scale).
+    Lines coloured by pressure (Blues_r: shallow=light, deep=dark).
+    Vertical markers for M2, S2, K1, O1 tides and inertial frequency.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from matplotlib.transforms import blended_transform_factory
+        import numpy as np
+        from scipy import signal as _signal
+
+        def welch_psd(x, dt_days, segment_length, overlap=0.5, window="hann"):
+            fs = 1.0 / dt_days
+            noverlap = int(round(overlap * segment_length))
+            f, p = _signal.welch(
+                x,
+                fs=fs,
+                window=window,
+                nperseg=segment_length,
+                noverlap=noverlap,
+                detrend="linear",
+                scaling="density",
+            )
+            return f, p
+
+        from . import parameters as P
+
+        # Ensure shape is (N_levels, N_time) — grid may be (time, pressure)
+        if da_temp.dims[0] != "pressure":
+            da_temp = da_temp.transpose("pressure", ...)
+        arr = da_temp.values  # (N_levels, N_time)
+        if "pressure" in da_temp.coords:
+            press_vals = da_temp.coords["pressure"].values.astype(float)
+        else:
+            press_vals = np.arange(arr.shape[0], dtype=float)
+
+        n_lev, n_time = arr.shape
+        dt_days = dt_seconds / 86400.0
+
+        # Segment length: 14-day target, min 128 samples, cap at n_time//4
+        seg_14d = max(128, int(14.0 / dt_days))
+        segment_length = min(seg_14d, max(n_time // 4, 128))
+
+        # Compute Welch PSD per level; skip levels with fewer valid samples than one segment
+        freq_out = None
+        psds, press_plotted = [], []
+        for k in range(n_lev):
+            col = arr[k, :].copy()
+            good = np.isfinite(col)
+            if good.sum() < segment_length:
+                continue
+            if not good.all():
+                col = np.interp(np.arange(n_time), np.where(good)[0], col[good])
+            freq, psd = welch_psd(col, dt_days, segment_length=segment_length)
+            if freq_out is None:
+                freq_out = freq
+            psds.append(psd)
+            press_plotted.append(press_vals[k])
+
+        if freq_out is None or not psds:
+            return None
+
+        # Frequency markers (period in days, colour)
+        # M2: 12.42 h (1.9323 cpd); K1: 23.93 h (1.0027 cpd)
+        markers = [
+            ("M2", 1.0 / 1.9323, "#c0392b"),
+            ("K1", 23.93 / 24.0, "#e67e22"),
+        ]
+        if lat != 0.0:
+            import gsw as _gsw
+
+            f_inert = abs(_gsw.f(lat))  # rad/s, Coriolis parameter
+            f_inert_cpd = f_inert * 86400.0 / (2.0 * np.pi)
+            f_period_h = 24.0 / f_inert_cpd
+            markers.append(
+                (f"f {f_period_h:.1f}h ({lat:.1f}°)", 1.0 / f_inert_cpd, "#27ae60")
+            )
+
+        # # Test tone: pure 24 h sinusoid (amplitude 1°C) to verify period axis
+        # t = np.arange(n_time) * dt_days
+        # tone = np.cos(2.0 * np.pi * t)  # 1 cpd = 24 h period, amplitude 1°C
+        # _, tone_psd = welch_psd(tone, dt_days, segment_length=segment_length)
+
+        # Colour map: shallow = light blue, deep = dark blue
+        p_arr = np.array(press_plotted)
+        p_min, p_max = p_arr.min(), p_arr.max()
+        if p_min == p_max:
+            p_min -= 1.0
+            p_max += 1.0
+        cmap = plt.get_cmap("Blues_r")
+        norm = mcolors.Normalize(vmin=p_min, vmax=p_max)
+
+        plt.style.use(str(P.MPLSTYLE))
+        fig, ax = plt.subplots(figsize=(11, 5))
+
+        # Axis limits: long period on left, Nyquist on right
+        nyq_period = 2.0 * dt_days
+        x_min = nyq_period
+        x_max = min(30.0, n_time * dt_days / 2.0)
+
+        # Exclude zero frequency and sub-Nyquist
+        fmask = (freq_out > 0) & (freq_out <= 1.0 / nyq_period)
+        freq_plot = freq_out[fmask]
+        period_plot = 1.0 / freq_plot  # days
+
+        for psd, p in zip(psds, press_plotted):
+            ax.loglog(period_plot, psd[fmask], color=cmap(norm(p)), lw=0.8, alpha=0.75)
+
+        # # 24 h test tone — uncomment to verify period axis (peak should sit at 1 day)
+        # ax.loglog(period_plot, tone_psd[fmask],
+        #           color="crimson", lw=1.0, ls=":", alpha=0.8, label="24 h test tone")
+
+        # −2 reference slope, pinned to median PSD near 1 cpd (period = 1 day)
+        idx_1d = np.argmin(np.abs(freq_plot - 1.0))
+        median_at_1d = float(np.median([psd[fmask][idx_1d] for psd in psds]))
+        if np.isfinite(median_at_1d) and median_at_1d > 0:
+            ref_periods = np.array([x_min, x_max])
+            # psd ∝ freq^-2 = period^2; anchor: at period=1, psd=median_at_1d
+            ref_psd = median_at_1d * ref_periods**2
+            ax.loglog(
+                ref_periods,
+                ref_psd,
+                color="k",
+                lw=0.9,
+                ls="--",
+                alpha=0.35,
+                label="−2 slope",
+            )
+
+        ax.set_xlim(x_max, x_min)
+
+        # Tidal/inertial markers — horizontal labels near top of axes
+        trans = blended_transform_factory(ax.transData, ax.transAxes)
+        for label, period_d, color in markers:
+            if x_min <= period_d <= x_max:
+                ax.axvline(period_d, color=color, lw=1.0, ls="--", alpha=0.65)
+                ax.text(
+                    period_d,
+                    0.98,
+                    f" {label} ",
+                    rotation=0,
+                    va="top",
+                    ha="center",
+                    fontsize=9,
+                    color=color,
+                    transform=trans,
+                    bbox=dict(
+                        boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.6
+                    ),
+                )
+
+        ax.set_ylim(1e-6, 1e2)
+        ax.set_xlabel("Period (days)")
+        ax.set_ylabel("PSD (°C² cpd⁻¹)")
+        ax.set_title("Temperature power spectrum (Welch per depth level)")
+        ax.legend(fontsize=7, loc="lower left")
+
+        # Colorbar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+        cbar.set_label("Pressure (dbar)")
+
+        plt.tight_layout()
+        b64 = _fig_to_base64(fig)
+        plt.close(fig)
+        return b64
+    except Exception as exc:
+        print(f"  WARNING: spectrum figure failed: {exc}")
+        return None
+
+
+def _make_grid_fig_b64(
+    da: "xr.DataArray",
+    title: str,
+    units: str,
+    cmap: str,
+    style: str = "pcolormesh",
+    contour_levels: Optional[list] = None,
+) -> Optional[str]:
+    """Render a grid figure from *da* (dims time × pressure); return base64 PNG or None.
+
+    *style* is ``'pcolormesh'`` (default) or ``'contourf'``.
+    *contour_levels*: if given, overlay black iso-contour lines at those values.
+    Data is always extracted as (pressure, time) by dimension name so the result
+    is correct regardless of how the NetCDF stores the dimensions.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from . import parameters as P
+
+        time = da.coords["time"].values
+        pressure = da.coords["pressure"].values
+        data = da.transpose("pressure", "time").values
+
+        plt.style.use(str(P.MPLSTYLE))
+        fig, ax = plt.subplots(figsize=(13, 4))
+        vmin = float(np.nanpercentile(data, P.COLORBAR_PLOW))
+        vmax = float(np.nanpercentile(data, P.COLORBAR_PHIGH))
+        import matplotlib.colors as mcolors
+
+        bounds = _nice_colorbar_bounds(vmin, vmax, n=20)
+        norm = mcolors.BoundaryNorm(bounds, ncolors=256)
+        if style == "contourf":
+            pc = ax.contourf(
+                time, pressure, data, levels=bounds, cmap=cmap, extend="both"
+            )
+        else:
+            pc = ax.pcolormesh(
+                time, pressure, data, shading="nearest", cmap=cmap, norm=norm
+            )
+        if contour_levels:
+            ct = ax.contour(
+                time,
+                pressure,
+                data,
+                levels=contour_levels,
+                colors="k",
+                linewidths=0.8,
+                alpha=0.75,
+            )
+            ax.clabel(ct, fmt="%.1f", fontsize=7, inline=True)
+        cb = fig.colorbar(pc, ax=ax, pad=0.02)
+        cb.set_label(f"{title} ({units})" if units else title, fontsize=10)
+        ax.invert_yaxis()
+        ax.set_ylabel("Pressure (dbar)")
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.set_xlabel("Time")
+        ax.set_title(f"{title} [{style}]")
+        plt.tight_layout()
+        b64 = _fig_to_base64(fig)
+        plt.close(fig)
+        return b64
+    except Exception:
+        return None
+
+
+def _rose_ax(
+    ax: "plt.Axes",
+    east: np.ndarray,
+    north: np.ndarray,
+    title: str = "",
+    n_dir: int = 16,
+    cmap: str = "Blues",
+) -> None:
+    """Draw a current rose on a polar Axes (compass convention, N up, CW).
+
+    Bars show fraction of time flowing toward each direction, coloured by
+    speed in 5 quantile bands (light = slow, dark = fast).
+    """
+    import matplotlib.pyplot as plt
+
+    speed = np.sqrt(east**2 + north**2)
+    direction = np.degrees(np.arctan2(east, north)) % 360  # 0=N, CW
+    valid = np.isfinite(speed) & np.isfinite(direction)
+    speed, direction = speed[valid], direction[valid]
+    if len(speed) < 2:
+        ax.set_visible(False)
+        return
+
+    dir_edges = np.linspace(0, 360, n_dir + 1)
+    dir_centers = (dir_edges[:-1] + dir_edges[1:]) / 2
+    theta = np.radians(dir_centers)
+    bar_width = 2 * np.pi / n_dir * 0.9
+
+    max_speed = max(float(np.nanpercentile(speed, 99)), 1e-9)
+    n_spd = 5
+    spd_edges = np.linspace(0, max_speed, n_spd + 1)
+    colors = getattr(plt.cm, cmap)(np.linspace(0.25, 1.0, n_spd))
+
+    total = len(speed)
+    freqs = np.zeros((n_dir, n_spd))
+    for i, (d0, d1) in enumerate(zip(dir_edges[:-1], dir_edges[1:])):
+        in_dir = (direction >= d0) & (direction < d1)
+        for j in range(n_spd):
+            in_spd = (speed >= spd_edges[j]) & (speed < spd_edges[j + 1])
+            freqs[i, j] = np.sum(in_dir & in_spd) / total
+
+    bottom = np.zeros(n_dir)
+    for j in range(n_spd):
+        ax.bar(
+            theta,
+            freqs[:, j],
+            width=bar_width,
+            bottom=bottom,
+            color=colors[j],
+            align="center",
+            linewidth=0.2,
+            edgecolor="white",
+        )
+        bottom += freqs[:, j]
+
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_xticks(np.radians([0, 90, 180, 270]))
+    ax.set_xticklabels(["N", "E", "S", "W"], fontsize=6)
+    ax.set_rticks([])
+    ax.set_title(title, fontsize=7, pad=2)
+
+
+def _xyz_to_enu_2d(
+    vx: np.ndarray,
+    vy: np.ndarray,
+    vz: np.ndarray,
+    heading_deg: np.ndarray,
+    pitch_deg: np.ndarray,
+    roll_deg: np.ndarray,
+    declination_deg: float = 0.0,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Rotate XYZ → ENU using the Nortek heading convention (vectorised).
+
+    Returns (east, north) arrays.  NaN propagates from any input.
+    """
+    h = np.radians(heading_deg - 90.0 + declination_deg)
+    p = np.radians(pitch_deg)
+    r = np.radians(roll_deg)
+    ch, sh = np.cos(h), np.sin(h)
+    cp, sp = np.cos(p), np.sin(p)
+    cr, sr = np.cos(r), np.sin(r)
+    east = (
+        ch * cp * vx + (-ch * sp * sr + sh * cr) * vy + (-ch * sp * cr - sh * sr) * vz
+    )
+    north = (
+        -sh * cp * vx + (sh * sp * sr + ch * cr) * vy + (sh * sp * cr - ch * sr) * vz
+    )
+    return east, north
+
+
+def _make_instrument_rose_b64(nc_path: Path) -> Optional[str]:
+    """Rose diagram grid for a single Aquadopp instrument.
+
+    Panels (left to right, only shown when data exist):
+      1. XYZ frame       — velocity_x / velocity_y (instrument frame, Greens)
+      2. ENU magnetic    — ENU computed with declination=0 (Purples); only when
+                           heading/pitch/roll and magnetic_declination are present
+      3. ENU true        — stored east/north_velocity (declination applied, Blues)
+         ENU good        — flag ≤ 2 subset of ENU true
+      4. ENU suspect/fail  — flag 3/4 subsets when present (Oranges / Reds)
+
+    Returns None if the file has no velocity data.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import xarray as xr
+        from . import parameters as P
+
+        ds = xr.open_dataset(nc_path, decode_timedelta=False).load()
+        ds.close()
+
+        panels = []  # list of (east, north, title, cmap)
+
+        # ── Panel 1: XYZ frame ────────────────────────────────────────
+        if "velocity_x" in ds.data_vars and "velocity_y" in ds.data_vars:
+            vx = ds["velocity_x"].values.astype(float)
+            vy = ds["velocity_y"].values.astype(float)
+            if np.any(np.isfinite(vx) & np.isfinite(vy)):
+                panels.append((vx, vy, "XYZ frame\n(instrument)", "Greens"))
+
+        # ── Panel 2: ENU magnetic (diagnostic, decl=0) ───────────────
+        has_xyz = all(f"velocity_{c}" in ds.data_vars for c in ("x", "y", "z"))
+        has_orientation = all(v in ds.data_vars for v in ("heading", "pitch", "roll"))
+        decl = ds.attrs.get("magnetic_declination")
+        if has_xyz and has_orientation and decl is not None:
+            vx_r = ds["velocity_x"].values.astype(float)
+            vy_r = ds["velocity_y"].values.astype(float)
+            vz_r = ds["velocity_z"].values.astype(float)
+            hdg = ds["heading"].values.astype(float)
+            pch = ds["pitch"].values.astype(float)
+            rll = ds["roll"].values.astype(float)
+            e_mag, n_mag = _xyz_to_enu_2d(vx_r, vy_r, vz_r, hdg, pch, rll, 0.0)
+            if np.any(np.isfinite(e_mag)):
+                panels.append((e_mag, n_mag, "ENU magnetic\n(decl = 0°)", "Purples"))
+
+        # ── Panels 3+: ENU true (with declination) — split by QC ─────
+        if "east_velocity" in ds.data_vars and "north_velocity" in ds.data_vars:
+            e_all = ds["east_velocity"].values.astype(float)
+            n_all = ds["north_velocity"].values.astype(float)
+            qc = (
+                ds["east_velocity_qc"].values.astype(int)
+                if "east_velocity_qc" in ds.data_vars
+                else np.ones(len(e_all), dtype=int)
+            )
+
+            def _masked(flag_mask):
+                e = e_all.copy()
+                n = n_all.copy()
+                e[~flag_mask] = np.nan
+                n[~flag_mask] = np.nan
+                return e, n
+
+            good_mask = qc <= 2
+            susp_mask = qc == 3
+            fail_mask = qc == 4
+
+            # Title for the good panel shows the actual declination applied
+            decl_str = f"{float(decl):+.1f}°" if decl is not None else "?"
+            enu_title = f"ENU true (decl = {decl_str})\nflag ≤ 2 (good)"
+            if np.any(np.isfinite(e_all[good_mask])):
+                panels.append((*_masked(good_mask), enu_title, "Blues"))
+            if np.any(np.isfinite(e_all[susp_mask])):
+                panels.append(
+                    (*_masked(susp_mask), "ENU — suspect\n(flag 3)", "Oranges")
+                )
+            if np.any(np.isfinite(e_all[fail_mask])):
+                panels.append((*_masked(fail_mask), "ENU — fail\n(flag 4)", "Reds"))
+
+        if not panels:
+            return None
+
+        plt.style.use(str(P.MPLSTYLE))
+        ncols = len(panels)
+        fig, axs = plt.subplots(
+            1,
+            ncols,
+            figsize=(ncols * 3.0, 3.2),
+            subplot_kw={"projection": "polar"},
+            squeeze=False,
+        )
+        for ax, (east, north, title, cmap) in zip(axs[0], panels):
+            _rose_ax(ax, east, north, title=title, cmap=cmap)
+
+        plt.tight_layout()
+        b64 = _fig_to_base64(fig)
+        plt.close(fig)
+        return b64
+    except Exception:
+        return None
+
+
+def _make_rose_grid_b64(
+    ds: "xr.Dataset",
+    serial_list: list,
+) -> Optional[str]:
+    """Grid of current roses (max 4 per row) for instruments with ENU velocity data."""
+    import math
+    import matplotlib.pyplot as plt
+    from . import parameters as P
+
+    if "east_velocity" not in ds.data_vars or "north_velocity" not in ds.data_vars:
+        return None
+
+    east_all = ds["east_velocity"].values.copy()  # (N_LEVELS, time)
+    north_all = ds["north_velocity"].values.copy()
+
+    if "east_velocity_qc" in ds.data_vars:
+        qc = ds["east_velocity_qc"].values
+        east_all[qc >= 3] = np.nan
+        north_all[qc >= 3] = np.nan
+
+    has_vel = [np.any(np.isfinite(east_all[i])) for i in range(east_all.shape[0])]
+    aqd_idx = [i for i in range(len(serial_list)) if i < len(has_vel) and has_vel[i]]
+    n = len(aqd_idx)
+    if n == 0:
+        return None
+
+    hab_vals = ds.coords["hab"].values if "hab" in ds.coords else None
+
+    ncols = min(n, 4)
+    nrows = math.ceil(n / ncols)
+
+    plt.style.use(str(P.MPLSTYLE))
+    fig, axs = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(ncols * 3.0, nrows * 3.2),
+        subplot_kw={"projection": "polar"},
+        squeeze=False,
+    )
+    axs_flat = axs.flatten()
+
+    for plot_i, instr_i in enumerate(aqd_idx):
+        serial = serial_list[instr_i] if instr_i < len(serial_list) else "?"
+        if hab_vals is not None and instr_i < len(hab_vals):
+            title = f"{serial} ({hab_vals[instr_i]:.0f} m)"
+        else:
+            title = str(serial)
+        _rose_ax(axs_flat[plot_i], east_all[instr_i], north_all[instr_i], title=title)
+
+    for k in range(n, len(axs_flat)):
+        axs_flat[k].set_visible(False)
+
+    plt.tight_layout()
+    b64 = _fig_to_base64(fig)
+    plt.close(fig)
+    return b64
+
+
+def _filter_sigma_tukey(
+    data: np.ndarray, window_samples: int, alpha: float = 0.5
+) -> np.ndarray:
+    """Apply a Tukey moving-average filter along axis=1 (time), NaN-aware.
+
+    NaN gaps are filled by linear interpolation before convolution, then
+    restored after so the filter does not propagate values across gaps.
+    """
+    from scipy.signal import convolve
+    from scipy.signal.windows import tukey
+
+    w = tukey(window_samples, alpha=alpha).astype(np.float64)
+    w /= w.sum()
+    n_p, n_t = data.shape
+    result = data.copy()
+    for k in range(n_p):
+        col = data[k, :]
+        nan_mask = ~np.isfinite(col)
+        if nan_mask.all():
+            continue
+        if nan_mask.any():
+            xi = np.where(~nan_mask)[0]
+            yi = col[~nan_mask]
+            if len(xi) < 2:
+                continue
+            filled = np.interp(np.arange(n_t), xi, yi)
+        else:
+            filled = col.copy()
+        smoothed = convolve(filled, w, mode="same")
+        smoothed[nan_mask] = np.nan
+        result[k, :] = smoothed
+    return result
+
+
+def _make_isopycnal_fig_b64(
+    da: "xr.DataArray",
+    levels: list,
+    filter_samples: int = 0,
+    zoom_center_idx: Optional[int] = None,
+    zoom_n: int = 0,
+) -> Optional[str]:
+    """Return base64 PNG: time × pressure with iso-sigma contour lines.
+
+    Parameters
+    ----------
+    levels : list of float
+        Sigma values to contour. First level is grey, rest are black.
+    filter_samples : int
+        If > 0, apply a 24 h Tukey (p=0.5) moving-average filter to the data.
+    zoom_center_idx : int, optional
+        If set along with zoom_n, slice time to [center-zoom_n//2 : center+zoom_n//2].
+    zoom_n : int
+        Width of the zoom window in time samples.
+
+    """
+    if not levels:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from . import parameters as P
+
+        da_tp = da.transpose("pressure", "time")
+        time_vals = da_tp["time"].values
+        pressure_vals = da_tp["pressure"].values
+        data = da_tp.values  # (n_pressure, n_time)
+
+        if zoom_center_idx is not None and zoom_n > 0:
+            t0 = max(0, zoom_center_idx - zoom_n // 2)
+            t1 = min(data.shape[1], t0 + zoom_n)
+            time_vals = time_vals[t0:t1]
+            data = data[:, t0:t1]
+
+        if filter_samples > 1 and data.shape[1] > filter_samples:
+            data = _filter_sigma_tukey(data, filter_samples)
+
+        level_colors = ["#808080"] + ["black"] * (len(levels) - 1)
+
+        plt.style.use(str(P.MPLSTYLE))
+        fig, ax = plt.subplots(figsize=(13, 4))
+        for lev, col in zip(levels, level_colors):
+            try:
+                ax.contour(
+                    time_vals,
+                    pressure_vals,
+                    data,
+                    levels=[lev],
+                    colors=[col],
+                    linewidths=1.2,
+                )
+            except Exception:
+                pass
+            ax.plot([], [], color=col, lw=1.2, label=f"σ₀ = {lev} kg m⁻³")
+
+        ax.invert_yaxis()
+        ax.set_ylabel("Pressure (dbar)")
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.set_xlabel("Time")
+        if levels:
+            ax.legend(fontsize=9, loc="upper right", framealpha=0.8)
+        plt.tight_layout()
+        b64 = _fig_to_base64(fig)
+        plt.close(fig)
+        return b64
+    except Exception:
+        return None
+
+
+_GRID_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grid report – {{ mooring_name }}</title>
+<style>
+  :root { --ocean:#1a3a5c; --seafoam:#e8f4f8; --muted:#95a5a6; --text:#2c3e50; }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; font-size:14px;
+         color:var(--text); max-width:1200px; margin:0 auto; padding:1.5rem 2rem 4rem; }
+  .masthead { background:var(--ocean); color:#fff; padding:1.4rem 2rem;
+              border-radius:8px; margin-bottom:2rem; }
+  .masthead h1 { margin:0 0 0.25rem; font-size:1.6rem; font-weight:700; }
+  .masthead .sub { font-size:0.88rem; opacity:0.82; margin:0 0 0.7rem; }
+  .masthead .back { font-size:0.82rem; opacity:0.8; margin:0; }
+  .masthead .back a { color:#fff; }
+  h2 { color:var(--ocean); font-size:1rem; border-bottom:2px solid var(--seafoam);
+       padding-bottom:0.3rem; margin:2.5rem 0 1rem; }
+  .fig { width:100%; border:1px solid #dce; border-radius:4px; margin-bottom:0.5rem; }
+  .note { color:var(--muted); font-size:0.82rem; margin-top:-0.5rem; }
+  .style-label { font-size:0.8rem; font-weight:600; color:var(--muted); margin:0.4rem 0 0.2rem; text-transform:uppercase; letter-spacing:0.05em; }
+  .var-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-bottom:1.5rem; }
+  .var-table th { background:var(--seafoam); text-align:left; padding:0.4rem 0.6rem; border-bottom:2px solid #cde; }
+  .var-table td { padding:0.3rem 0.6rem; border-bottom:1px solid #eef; vertical-align:top; }
+  .var-table tr:hover td { background:#f8fcff; }
+  .report-footer { margin-top:3rem; font-size:0.76rem; color:var(--muted); border-top:1px solid #eee; padding-top:0.8rem; }
+  @media print { .masthead { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <h1>{{ mooring_name }} &mdash; Gridded data</h1>
+  <p class="sub">{{ deploy_time }} &ndash; {{ recover_time }} &bull; {{ n_levels }} pressure levels &bull; {{ n_time }} time steps</p>
+  <p class="back">
+    <a href="{{ mooring_report_link }}">&#8592; {{ mooring_name }} summary</a>
+    {% if stack_exists %} &bull; <a href="{{ mooring_name }}_stack_report.html">Stack report &#8596;</a>{% endif %}
+  </p>
+</div>
+
+{% if var_table %}
+<h2>Variables in file</h2>
+<table class="var-table">
+  <thead><tr><th>Variable</th><th>Long name</th><th>Units</th><th>Coverage</th></tr></thead>
+  <tbody>
+  {% for v in var_table %}
+  <tr><td><code>{{ v.name }}</code></td><td>{{ v.long_name }}</td><td>{{ v.units }}</td><td>{{ v.coverage }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<!-- Temperature -->
+{% if fig_temp_b64 or fig_temp_cf_b64 %}
+<h2>Temperature</h2>
+<p class="note">{{ p_range }} &bull; colour range: {{ temp_plow }}–{{ temp_phigh }} °C (5th–95th percentile) &bull; 20 discrete levels</p>
+{% if fig_temp_b64 %}
+<p class="style-label">pcolormesh</p>
+<img class="fig" src="data:image/png;base64,{{ fig_temp_b64 }}" alt="Temperature pcolormesh">
+{% endif %}
+{% if fig_temp_cf_b64 %}
+<p class="style-label">contourf</p>
+<img class="fig" src="data:image/png;base64,{{ fig_temp_cf_b64 }}" alt="Temperature contourf">
+{% endif %}
+{% endif %}
+
+<!-- Salinity -->
+{% if fig_sal_b64 or fig_sal_cf_b64 %}
+<h2>Practical Salinity</h2>
+<p class="note">{{ sal_source }} &bull; colour range: {{ sal_plow }}–{{ sal_phigh }} (5th–95th percentile) &bull; 20 discrete levels</p>
+{% if fig_sal_b64 %}
+<p class="style-label">pcolormesh</p>
+<img class="fig" src="data:image/png;base64,{{ fig_sal_b64 }}" alt="Salinity pcolormesh">
+{% endif %}
+{% if fig_sal_cf_b64 %}
+<p class="style-label">contourf</p>
+<img class="fig" src="data:image/png;base64,{{ fig_sal_cf_b64 }}" alt="Salinity contourf">
+{% endif %}
+{% endif %}
+
+<!-- Potential density -->
+{% for sec in sigma_sections %}
+<h2>{{ sec.label }}</h2>
+<p class="note">{{ p_range }} &bull; colour range: {{ sec.plow }}–{{ sec.phigh }} {{ sec.units }} (5th–95th percentile) &bull; 20 discrete levels</p>
+{% if sec.fig_b64 %}
+<p class="style-label">pcolormesh</p>
+<img class="fig" src="data:image/png;base64,{{ sec.fig_b64 }}" alt="{{ sec.label }} pcolormesh">
+{% endif %}
+{% if sec.fig_cf_b64 %}
+<p class="style-label">contourf</p>
+<img class="fig" src="data:image/png;base64,{{ sec.fig_cf_b64 }}" alt="{{ sec.label }} contourf">
+{% endif %}
+{% if sec.isopycnal_zoom_b64 %}
+<h2>Isopycnal depths &mdash; {{ sec.name }} (3-day zoom, unfiltered)</h2>
+<p class="note">3-day window centred on deployment midpoint &bull; raw gridded data &bull; no temporal filter applied.</p>
+<img class="fig" src="data:image/png;base64,{{ sec.isopycnal_zoom_b64 }}" alt="Isopycnal depths zoom {{ sec.label }}">
+{% endif %}
+{% if sec.isopycnal_b64 %}
+<h2>Isopycnal depths &mdash; {{ sec.name }} (full record, 24 h Tukey filtered)</h2>
+<p class="note">Full deployment &bull; 24 h Tukey (α=0.5) moving-average applied before contouring to reduce tidal noise.</p>
+<img class="fig" src="data:image/png;base64,{{ sec.isopycnal_b64 }}" alt="Isopycnal depths {{ sec.label }}">
+{% endif %}
+{% endfor %}
+
+<!-- ENU velocity grids (vertical interpolation only, no time gap fill) -->
+{% for sec in vel_sections %}
+<h2>{{ sec.label }}</h2>
+<p class="note">Vertically interpolated to regular pressure grid. QC-flagged samples (tilt or QARTOD) excluded before interpolation. No temporal gap fill — NaN where no data at a given time step.</p>
+{% if sec.fig_b64 %}
+<img class="fig" src="data:image/png;base64,{{ sec.fig_b64 }}" alt="{{ sec.label }} grid">
+{% endif %}
+{% endfor %}
+
+{% if fig_spectrum_b64 %}
+<h2>Temperature power spectrum</h2>
+<p class="note">Welch PSD (Hann window, 14-day segments, 50% overlap). One line per depth level; colour indicates pressure (shallow = light blue, deep = dark blue). Dashed vertical lines mark tidal and inertial frequencies. Dashed black line: &minus;2 spectral slope reference.</p>
+<img class="fig" src="data:image/png;base64,{{ fig_spectrum_b64 }}" alt="Temperature power spectrum">
+{% endif %}
+
+<div class="report-footer">
+  Generated by <strong>oceanarray</strong> on {{ generated }}
+</div>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Stack report HTML template
+# ---------------------------------------------------------------------------
+
+_STACK_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack report &ndash; {{ mooring_name }}</title>
+<style>
+  :root { --ocean:#1a3a5c; --seafoam:#e8f4f8; --muted:#95a5a6; --text:#2c3e50; }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; font-size:14px;
+         color:var(--text); max-width:1200px; margin:0 auto; padding:1.5rem 2rem 4rem; }
+  .masthead { background:var(--ocean); color:#fff; padding:1.4rem 2rem;
+              border-radius:8px; margin-bottom:2rem; }
+  .masthead h1 { margin:0 0 0.25rem; font-size:1.6rem; font-weight:700; }
+  .masthead .sub { font-size:0.88rem; opacity:0.82; margin:0 0 0.7rem; }
+  .masthead .back { font-size:0.82rem; opacity:0.8; margin:0; }
+  .masthead .back a { color:#fff; }
+  h2 { color:var(--ocean); font-size:1rem; border-bottom:2px solid var(--seafoam);
+       padding-bottom:0.3rem; margin:2.5rem 0 1rem; }
+  .fig { width:100%; border:1px solid #dce; border-radius:4px; margin-bottom:1.5rem; }
+  .var-table, .instr-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-bottom:1.5rem; }
+  .var-table th, .instr-table th { background:var(--seafoam); text-align:left;
+       padding:0.4rem 0.6rem; border-bottom:2px solid #cde; }
+  .var-table td, .instr-table td { padding:0.3rem 0.6rem; border-bottom:1px solid #eef; vertical-align:top; }
+  .var-table tr:hover td, .instr-table tr:hover td { background:#f8fcff; }
+  .report-footer { margin-top:3rem; font-size:0.76rem; color:var(--muted); border-top:1px solid #eee; padding-top:0.8rem; }
+  @media print { .masthead { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <h1>{{ mooring_name }} &mdash; Stacked data</h1>
+  <p class="sub">{{ deploy_time }} &ndash; {{ recover_time }} &bull; {{ n_instr }} instruments &bull; {{ dt_seconds }}s grid &bull; {{ n_time }} time steps</p>
+  <p class="back">
+    <a href="{{ mooring_report_link }}">&#8592; {{ mooring_name }} summary</a>
+    {% if grid_exists %} &bull; <a href="{{ mooring_name }}_grid_report.html">Grid report &#8596;</a>{% endif %}
+  </p>
+</div>
+
+<!-- Instrument list -->
+<h2>Instruments (deep-first)</h2>
+<table class="instr-table">
+  <thead><tr><th>#</th><th>Type</th><th>Serial</th><th>HAB (m)</th><th>~Depth (m)</th><th>Stage</th></tr></thead>
+  <tbody>
+  {% for row in instr_rows %}
+  <tr>
+    <td>{{ loop.index0 }}</td>
+    <td>{{ row.instr_type }}</td>
+    <td>{{ row.serial }}</td>
+    <td>{{ row.hab }}</td>
+    <td>{{ row.depth }}</td>
+    <td>{{ row.stage }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<!-- Variables present -->
+{% if var_table %}
+<h2>Variables in file</h2>
+<table class="var-table">
+  <thead><tr><th>Variable</th><th>Long name</th><th>Units</th><th>Coverage</th></tr></thead>
+  <tbody>
+  {% for v in var_table %}
+  <tr><td><code>{{ v.name }}</code></td><td>{{ v.long_name }}</td><td>{{ v.units }}</td><td>{{ v.coverage }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<!-- Pressure time series -->
+{% if fig_pressure_b64 %}
+<h2>Pressure records (all instruments)</h2>
+<img class="fig" src="data:image/png;base64,{{ fig_pressure_b64 }}" alt="Pressure time series">
+{% endif %}
+
+<!-- Temperature time series -->
+{% if fig_temp_b64 %}
+<h2>Temperature (all instruments)</h2>
+<img class="fig" src="data:image/png;base64,{{ fig_temp_b64 }}" alt="Temperature time series">
+{% endif %}
+
+<!-- Salinity time series -->
+{% if fig_sal_b64 %}
+<h2>Salinity (all instruments)</h2>
+<img class="fig" src="data:image/png;base64,{{ fig_sal_b64 }}" alt="Salinity time series">
+{% endif %}
+
+<!-- Instrument spacing histogram -->
+{% if fig_east_vel_b64 %}
+<h2>East velocity (U)</h2>
+<p class="note">East component of velocity (ENU frame) for all instruments. Instruments without velocity data are omitted.</p>
+<img class="fig" src="data:image/png;base64,{{ fig_east_vel_b64 }}" alt="East velocity time series">
+{% endif %}
+
+{% if fig_north_vel_b64 %}
+<h2>North velocity (V)</h2>
+<p class="note">North component of velocity (ENU frame) for all instruments.</p>
+<img class="fig" src="data:image/png;base64,{{ fig_north_vel_b64 }}" alt="North velocity time series">
+{% endif %}
+
+{% if fig_up_vel_b64 %}
+<h2>Vertical velocity (W)</h2>
+<p class="note">Up component of velocity (ENU frame) for all instruments.</p>
+<img class="fig" src="data:image/png;base64,{{ fig_up_vel_b64 }}" alt="Vertical velocity time series">
+{% endif %}
+
+{% if fig_rose_grid_b64 %}
+<h2>Current rose diagrams</h2>
+<p class="note">Direction the current flows toward (oceanographic convention, 0°=N). Speed coloured light→dark blue (slow→fast). QC-flagged samples excluded. Title shows serial number and height above bottom (m).</p>
+{% if rose_declination_note %}<p class="note">{{ rose_declination_note }}</p>{% endif %}
+<img class="fig" src="data:image/png;base64,{{ fig_rose_grid_b64 }}" alt="Current rose grid">
+{% endif %}
+
+{% if fig_spacing_b64 %}
+<h2>Adjacent instrument spacing</h2>
+<p class="note">Distribution of pressure differences between adjacent instrument pairs (pairs &lt; 2 dbar apart excluded as co-located).</p>
+<img class="fig" src="data:image/png;base64,{{ fig_spacing_b64 }}" alt="Instrument spacing histogram">
+{% endif %}
+
+<div class="report-footer">
+  Generated by <strong>oceanarray</strong> on {{ generated }}
+</div>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Per-instrument HTML template
 # ---------------------------------------------------------------------------
 
@@ -1563,6 +2532,17 @@ _INSTRUMENT_HTML_TEMPLATE = """\
 <img class="fig" src="data:image/png;base64,{{ fig_tsd_b64 }}">
 {% endif %}
 
+<!-- ══ Current roses ══ -->
+{% if fig_rose_b64 %}
+<h2>Current rose diagrams</h2>
+<p style="font-size:0.8rem;color:#555;margin-top:-0.5rem;">
+  XYZ: instrument-frame velocities (before geographic rotation).
+  ENU panels split by QARTOD flag: good (flag&nbsp;≤&nbsp;2, Blues), suspect (flag&nbsp;3, Oranges), fail (flag&nbsp;4, Reds).
+  Direction toward which the current flows; 0°&nbsp;=&nbsp;N, clockwise.
+</p>
+<img class="fig" src="data:image/png;base64,{{ fig_rose_b64 }}">
+{% endif %}
+
 <!-- ══ Data distributions ══ -->
 <h2>Data value distributions</h2>
 <p style="font-size:0.8rem;color:#555;margin-top:-0.5rem;">
@@ -1628,7 +2608,7 @@ _INSTRUMENT_HTML_TEMPLATE = """\
 <h3 style="font-size:0.88rem;color:var(--ocean);margin:1rem 0 0.4rem;">Time-series variables</h3>
 <table>
   <thead>
-    <tr><th>Variable</th><th>Dims</th><th class="num">N</th><th>Units</th><th>Long name</th><th>Standard name</th><th>QC&nbsp;flag</th></tr>
+    <tr><th>Variable</th><th>Dims</th><th class="num">N</th><th class="num">Valid</th><th>Units</th><th>Long name</th><th>Standard name</th><th>QC&nbsp;flag</th></tr>
   </thead>
   <tbody>
     {% for v in nc_meta.time_vars %}
@@ -1637,6 +2617,7 @@ _INSTRUMENT_HTML_TEMPLATE = """\
       <td class="mono">{{ v.name }}</td>
       <td class="mono" style="font-size:0.75rem">{{ v.dims }}</td>
       <td class="num">{{ "{:,}".format(v.n) }}</td>
+      <td class="num" {% if v.n_valid is defined and v.n_valid < v.n %}style="color:#c0392b;font-weight:600"{% endif %}>{{ "{:,}".format(v.n_valid) if v.n_valid is defined else "&mdash;" }}</td>
       <td>{{ v.units }}</td>
       <td>{{ v.long_name }}</td>
       <td style="font-size:0.78rem;color:var(--muted)">{{ v.standard_name }}</td>
@@ -1709,6 +2690,9 @@ class MooringReport:
         force: bool = False,
         outdir: Optional[str] = None,
         serials: Optional[List[str]] = None,
+        instruments: bool = False,
+        grid: bool = False,
+        stack: bool = False,
     ) -> Optional[Path]:
         proc_dir = _get_proc_dir(self.base_dir, mooring_name)
         if not proc_dir.exists():
@@ -1722,7 +2706,7 @@ class MooringReport:
             out_dir = proc_dir
         output_path = out_dir / f"{mooring_name}_report.html"
         if output_path.exists() and not force:
-            print(f"OUTFILE EXISTS: {output_path.name}  (use --force to overwrite)")
+            _status("skip", str(output_path.relative_to(self.base_dir)))
             return output_path
 
         yaml_path = proc_dir / f"{mooring_name}.mooring.yaml"
@@ -1736,20 +2720,511 @@ class MooringReport:
         ctx = self._build_context(mooring_name, cfg, proc_dir, yaml_path)
         html = self._render(ctx)
         output_path.write_text(html, encoding="utf-8")
-        print(f"Written: {output_path}")
+        _status("file", str(output_path.relative_to(self.base_dir)))
 
-        # Per-instrument pages
-        self._generate_instrument_pages(
-            mooring_name,
-            ctx["instruments"],
-            cfg,
-            proc_dir,
-            out_dir,
-            force,
-            serials=serials,
-        )
+        # Per-instrument pages (opt-in via --instruments or --serial)
+        if instruments:
+            self._generate_instrument_pages(
+                mooring_name,
+                ctx["instruments"],
+                cfg,
+                proc_dir,
+                out_dir,
+                force,
+                serials=serials,
+            )
+
+        # Grid report page (opt-in via --grid)
+        if grid:
+            grid_path = proc_dir / f"{mooring_name}_grid.nc"
+            if grid_path.exists():
+                self._generate_grid_page(mooring_name, grid_path, ctx, out_dir, force)
+            else:
+                print("  NOTE: no grid file found — run 'oceanarray grid' first")
+
+        # Stack report page (opt-in via --stack)
+        if stack:
+            stack_path = proc_dir / f"{mooring_name}_stack.nc"
+            if stack_path.exists():
+                self._generate_stack_page(mooring_name, stack_path, ctx, out_dir, force)
+            else:
+                print("  NOTE: no stack file found — run 'oceanarray stack' first")
 
         return output_path
+
+    # ------------------------------------------------------------------
+    def _generate_grid_page(
+        self,
+        mooring_name: str,
+        grid_path: Path,
+        ctx: Dict,
+        out_dir: Path,
+        force: bool,
+    ) -> None:
+        """Generate a grid report HTML page with T/S pcolormesh figures."""
+        out_path = out_dir / f"{mooring_name}_grid_report.html"
+        if out_path.exists() and not force:
+            print(f"  OUTFILE EXISTS: {out_path.name}  (use --force to overwrite)")
+            return
+
+        try:
+            import xarray as xr
+            from . import parameters as P
+
+            ds = xr.open_dataset(grid_path).load()
+            pressure = ds["pressure"].values
+            n_levels = len(pressure)
+            n_time = ds.sizes["time"]
+            p_min, p_max = int(pressure.min()), int(pressure.max())
+            p_range = f"{p_min}–{p_max} dbar"
+
+            # Temperature
+            fig_temp_b64 = fig_temp_cf_b64 = temp_plow = temp_phigh = None
+            if "temperature" in ds:
+                T_da = ds["temperature"]
+                T_units = T_da.attrs.get("units", "degC")
+                T_vals = T_da.values
+                temp_plow = f"{np.nanpercentile(T_vals, P.COLORBAR_PLOW):.2f}"
+                temp_phigh = f"{np.nanpercentile(T_vals, P.COLORBAR_PHIGH):.2f}"
+                fig_temp_b64 = _make_grid_fig_b64(
+                    T_da, "Temperature", T_units, "RdYlBu_r"
+                )
+                fig_temp_cf_b64 = _make_grid_fig_b64(
+                    T_da, "Temperature", T_units, "RdYlBu_r", style="contourf"
+                )
+
+            # Salinity — use stored variable or derive from T/C via GSW
+            fig_sal_b64 = sal_plow = sal_phigh = None
+            sal_source = ""
+            SP_da = None
+            if "salinity" in ds:
+                SP_da = ds["salinity"]
+                sal_units = SP_da.attrs.get("units", "1")
+                sal_source = "practical salinity from _grid.nc"
+            elif "conductivity" in ds and "temperature" in ds:
+                import gsw
+
+                # Extract as (time, pressure) — consistent with OceanSITES order
+                T_tp = ds["temperature"].transpose("time", "pressure").values
+                C_tp = ds["conductivity"].transpose("time", "pressure").values
+                SP_vals = gsw.SP_from_C(C_tp, T_tp, pressure[np.newaxis, :])
+                SP_da = xr.DataArray(
+                    SP_vals,
+                    dims=("time", "pressure"),
+                    coords={"time": ds["time"], "pressure": ds["pressure"]},
+                )
+                sal_units = "1"
+                sal_source = "practical salinity computed from T, C via GSW"
+            fig_sal_cf_b64 = None
+            if SP_da is not None:
+                sal_plow = f"{np.nanpercentile(SP_da.values, P.COLORBAR_PLOW):.3f}"
+                sal_phigh = f"{np.nanpercentile(SP_da.values, P.COLORBAR_PHIGH):.3f}"
+                fig_sal_b64 = _make_grid_fig_b64(
+                    SP_da, "Practical Salinity", sal_units, "YlGnBu_r"
+                )
+                fig_sal_cf_b64 = _make_grid_fig_b64(
+                    SP_da, "Practical Salinity", sal_units, "YlGnBu_r", style="contourf"
+                )
+
+            # Velocity grids (ENU) — vertical interpolation only (no time gap fill)
+            vel_sections = []
+            for vel_var, vel_label, vel_cmap in [
+                ("east_velocity", "East velocity (U)", "RdBu_r"),
+                ("north_velocity", "North velocity (V)", "RdBu_r"),
+                ("up_velocity", "Up velocity (W)", "RdBu_r"),
+            ]:
+                if vel_var not in ds.data_vars:
+                    continue
+                da_vel = ds[vel_var]
+                vel_units = da_vel.attrs.get("units", "m s-1")
+                # Apply QC mask from corresponding _qc variable if present
+                qc_var = f"{vel_var}_qc"
+                if qc_var in ds.data_vars:
+                    qc_vals = ds[qc_var].values
+                    vel_data = da_vel.values.copy()
+                    vel_data[qc_vals >= 3] = np.nan
+                    import xarray as _xr
+
+                    da_vel = _xr.DataArray(
+                        vel_data,
+                        dims=da_vel.dims,
+                        coords=da_vel.coords,
+                        attrs=da_vel.attrs,
+                    )
+                vel_sections.append(
+                    {
+                        "label": vel_label,
+                        "units": vel_units,
+                        "fig_b64": _make_grid_fig_b64(
+                            da_vel, vel_label, vel_units, vel_cmap
+                        ),
+                    }
+                )
+
+            # Variable summary table
+            var_table = []
+            for vname in ds.data_vars:
+                da_v = ds[vname]
+                if "time" not in da_v.dims:
+                    continue
+                n_total = da_v.size
+                n_valid = int(np.sum(np.isfinite(da_v.values)))
+                pct = f"{100 * n_valid / n_total:.0f}%" if n_total > 0 else "—"
+                var_table.append(
+                    {
+                        "name": vname,
+                        "long_name": da_v.attrs.get("long_name", ""),
+                        "units": da_v.attrs.get("units", ""),
+                        "coverage": pct,
+                    }
+                )
+
+            # Potential density (sigma0, sigma2, …)
+            sigma_sections = []
+            for sv in [
+                v
+                for v in ds.data_vars
+                if v.startswith("sigma") and "pressure" in ds[v].dims
+            ]:
+                da = ds[sv]
+                label = da.attrs.get("long_name", sv)
+                units_s = da.attrs.get("units", "kg m-3")
+                vals = da.values
+                sig_plow = f"{np.nanpercentile(vals, P.COLORBAR_PLOW):.4f}"
+                sig_phigh = f"{np.nanpercentile(vals, P.COLORBAR_PHIGH):.4f}"
+                # Filter parameters: 24 h Tukey window in samples
+                _dt_s = float(ds.attrs.get("dt_seconds", 60))
+                _filter_s = max(3, int(24 * 3600 / _dt_s))
+                _n_t = da.sizes["time"]
+                _zoom_center = _n_t // 2
+                _zoom_n = max(3, int(3 * 24 * 3600 / _dt_s))  # 3 days
+                sigma_sections.append(
+                    {
+                        "name": sv,
+                        "label": label,
+                        "units": units_s,
+                        "plow": sig_plow,
+                        "phigh": sig_phigh,
+                        "fig_b64": _make_grid_fig_b64(
+                            da,
+                            label,
+                            units_s,
+                            P.DENSITY_COLORMAP,
+                        ),
+                        "fig_cf_b64": _make_grid_fig_b64(
+                            da,
+                            label,
+                            units_s,
+                            P.DENSITY_COLORMAP,
+                            style="contourf",
+                        ),
+                        "isopycnal_zoom_b64": _make_isopycnal_fig_b64(
+                            da,
+                            P.SIGMA_CONTOUR_LEVELS,
+                            zoom_center_idx=_zoom_center,
+                            zoom_n=_zoom_n,
+                        )
+                        if P.SIGMA_CONTOUR_LEVELS
+                        else None,
+                        "isopycnal_b64": _make_isopycnal_fig_b64(
+                            da, P.SIGMA_CONTOUR_LEVELS, filter_samples=_filter_s
+                        )
+                        if P.SIGMA_CONTOUR_LEVELS
+                        else None,
+                    }
+                )
+            # Temperature power spectrum
+            fig_spectrum_b64 = None
+            if "temperature" in ds:
+                _dt_s = float(ds.attrs.get("dt_seconds", 3600))
+                _lat = 0.0
+                for _lat_key in ("seabed_latitude", "deployment_latitude", "latitude"):
+                    _lv = ds.attrs.get(_lat_key)
+                    if _lv is not None:
+                        try:
+                            from .mooring_level import _dms_to_deg
+
+                            _lat = _dms_to_deg(str(_lv))
+                            break
+                        except Exception:
+                            pass
+                fig_spectrum_b64 = _make_spectrum_fig_b64(
+                    ds["temperature"], _dt_s, lat=_lat
+                )
+
+            ds.close()
+
+            stack_exists = (grid_path.parent / f"{mooring_name}_stack.nc").exists()
+
+            from jinja2 import Environment
+
+            env = Environment(autoescape=True)
+            html = env.from_string(_GRID_HTML_TEMPLATE).render(
+                mooring_name=mooring_name,
+                deploy_time=ctx["deploy_time"],
+                recover_time=ctx["recover_time"],
+                n_levels=n_levels,
+                n_time=n_time,
+                p_range=p_range,
+                mooring_report_link=f"{mooring_name}_report.html",
+                stack_exists=stack_exists,
+                var_table=var_table,
+                fig_temp_b64=fig_temp_b64,
+                fig_temp_cf_b64=fig_temp_cf_b64,
+                temp_plow=temp_plow,
+                temp_phigh=temp_phigh,
+                fig_sal_b64=fig_sal_b64,
+                fig_sal_cf_b64=fig_sal_cf_b64,
+                sal_plow=sal_plow,
+                sal_phigh=sal_phigh,
+                sal_source=sal_source,
+                sigma_sections=sigma_sections,
+                vel_sections=vel_sections,
+                fig_spectrum_b64=fig_spectrum_b64,
+                generated=ctx["generated"],
+            )
+            out_path.write_text(html, encoding="utf-8")
+            _status("file", str(out_path.relative_to(self.base_dir)))
+        except Exception as exc:
+            print(f"  ERROR generating grid report: {exc}")
+
+    # ------------------------------------------------------------------
+    def _generate_stack_page(
+        self,
+        mooring_name: str,
+        stack_path: Path,
+        ctx: Dict,
+        out_dir: Path,
+        force: bool,
+    ) -> None:
+        """Generate a stack report HTML page with pressure and T time series."""
+        out_path = out_dir / f"{mooring_name}_stack_report.html"
+        if out_path.exists() and not force:
+            _status("skip", str(out_path.relative_to(self.base_dir)))
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            import xarray as xr
+            from . import parameters as P
+
+            ds = xr.open_dataset(stack_path).load()
+            n_time = ds.sizes["time"]
+            n_instr = ds.sizes["N_LEVELS"]
+            dt_seconds = ds.attrs.get("dt_seconds", "?")
+            waterdepth = float(ds.attrs.get("waterdepth", 0) or 0)
+
+            # Downsample for plotting — target ~5000 time points per trace
+            step = max(1, n_time // 5000)
+            time_ds = ds["time"].values[::step]
+
+            serials = ds["serial"].values
+            instr_types = ds["instrument_type"].values
+            habs = ds["hab"].values
+
+            # Instrument table rows
+            instr_rows = []
+            for i in range(n_instr):
+                depth = f"{waterdepth - habs[i]:.0f}" if waterdepth else "—"
+                instr_rows.append(
+                    {
+                        "serial": serials[i],
+                        "instr_type": instr_types[i],
+                        "hab": f"{habs[i]:.1f}",
+                        "depth": depth,
+                        "stage": "",
+                    }
+                )
+
+            # Variable table
+            var_table = []
+            for vname in ds.data_vars:
+                da_v = ds[vname]
+                if ds[vname].dims != ("N_LEVELS", "time"):
+                    continue
+                n_total = da_v.size
+                n_valid = int(np.sum(np.isfinite(da_v.values)))
+                pct = f"{100 * n_valid / n_total:.0f}%" if n_total > 0 else "—"
+                var_table.append(
+                    {
+                        "name": vname,
+                        "long_name": da_v.attrs.get("long_name", ""),
+                        "units": da_v.attrs.get("units", ""),
+                        "coverage": pct,
+                    }
+                )
+
+            plt.style.use(str(P.MPLSTYLE))
+
+            # Assign one colour per serial number so each instrument is distinct
+            _serial_list = list(serials)
+            _tab20 = plt.get_cmap("tab20")
+            _serial_colors = {s: _tab20(i % 20) for i, s in enumerate(_serial_list)}
+
+            def _ts_fig(
+                varname: str, ylabel: str, invert: bool = False
+            ) -> Optional[str]:
+                if varname not in ds.data_vars:
+                    return None
+                arr = ds[
+                    varname
+                ].values.copy()  # (N_LEVELS, time) — copy so we can mask
+                # NaN out suspect/bad samples using corresponding QC variable if present
+                qc_varname = f"{varname}_qc"
+                if qc_varname in ds.data_vars:
+                    qc = ds[
+                        qc_varname
+                    ].values  # float (NaN where no QC); NaN>=3 is False → safe
+                    arr[qc >= 3] = np.nan
+                fig, ax = plt.subplots(figsize=(13, 4))
+                plotted = False
+                for i in range(n_instr):
+                    serial = _serial_list[i]
+                    color = _serial_colors[serial]
+                    y = arr[i, ::step]
+                    if not np.any(np.isfinite(y)):
+                        continue  # skip instruments with no data for this variable
+                    plotted = True
+                    ax.plot(
+                        time_ds, y, color=color, lw=0.7, alpha=0.85, label=f"{serial}"
+                    )
+                if not plotted:
+                    plt.close(fig)
+                    return None
+                if invert:
+                    ax.invert_yaxis()
+                locator = mdates.AutoDateLocator()
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+                ax.set_ylabel(ylabel)
+                ax.set_xlabel("Time")
+                n_plotted = sum(
+                    1 for i in range(n_instr) if np.any(np.isfinite(arr[i, ::step]))
+                )
+                ax.legend(
+                    fontsize=7,
+                    loc="upper right",
+                    framealpha=0.8,
+                    ncol=max(1, n_plotted // 8),
+                )
+                plt.tight_layout()
+                b64 = _fig_to_base64(fig)
+                plt.close(fig)
+                return b64
+
+            fig_pressure_b64 = _ts_fig("pressure", "Pressure (dbar)", invert=True)
+            fig_temp_b64 = _ts_fig(
+                "temperature",
+                f"Temperature ({ds['temperature'].attrs.get('units', '°C')})"
+                if "temperature" in ds
+                else "Temperature",
+            )
+            fig_sal_b64 = (
+                _ts_fig(
+                    "salinity",
+                    f"Salinity ({ds['salinity'].attrs.get('units', '')})"
+                    if "salinity" in ds
+                    else None,
+                )
+                if "salinity" in ds
+                else None
+            )
+            fig_east_vel_b64 = (
+                _ts_fig("east_velocity", "U — East velocity (m/s)")
+                if "east_velocity" in ds
+                else None
+            )
+            fig_north_vel_b64 = (
+                _ts_fig("north_velocity", "V — North velocity (m/s)")
+                if "north_velocity" in ds
+                else None
+            )
+            fig_up_vel_b64 = (
+                _ts_fig("up_velocity", "W — Up velocity (m/s)")
+                if "up_velocity" in ds
+                else None
+            )
+
+            # Current rose grid (instruments with ENU velocity)
+            fig_rose_grid_b64 = _make_rose_grid_b64(ds, _serial_list)
+            # Magnetic declination note for rose section: collect unique non-None values
+            _decl_vals = []
+            if "magnetic_declination" in ds.data_vars:
+                _dv = ds["magnetic_declination"].values
+                _decl_vals = sorted(
+                    {round(float(v), 2) for v in _dv if np.isfinite(float(v))}
+                )
+            rose_declination_note = (
+                f"Magnetic declination applied: {', '.join(f'{v:+.2f}°' for v in _decl_vals)}"
+                if _decl_vals
+                else None
+            )
+
+            # Instrument spacing histogram
+            fig_spacing_b64: Optional[str] = None
+            if "pressure" in ds.data_vars and n_instr > 1:
+                try:
+                    pres_arr = ds["pressure"].values  # (N_LEVELS, time)
+                    # Sort by median pressure so adjacent pairs are actually depth-adjacent
+                    med_p = np.nanmedian(pres_arr, axis=1)
+                    sort_idx = np.argsort(med_p)
+                    pres_sorted = pres_arr[sort_idx, :]
+                    all_spacings: list = []
+                    for i in range(1, n_instr):
+                        spacing = pres_sorted[i, :] - pres_sorted[i - 1, :]
+                        valid = spacing[np.isfinite(spacing) & (spacing >= 2.0)]
+                        all_spacings.extend(valid.tolist())
+                    if all_spacings:
+                        fig_sp, ax_sp = plt.subplots(figsize=(8, 4))
+                        ax_sp.hist(
+                            all_spacings,
+                            bins="auto",
+                            color="steelblue",
+                            edgecolor="white",
+                        )
+                        ax_sp.set_xlabel("Instrument spacing (dbar)")
+                        ax_sp.set_ylabel("Count (instrument pair × time step)")
+                        ax_sp.set_title("Adjacent instrument spacing distribution")
+                        plt.tight_layout()
+                        fig_spacing_b64 = _fig_to_base64(fig_sp)
+                        plt.close(fig_sp)
+                except Exception:
+                    pass
+
+            ds.close()
+
+            grid_exists = (stack_path.parent / f"{mooring_name}_grid.nc").exists()
+
+            from jinja2 import Environment
+
+            env = Environment(autoescape=True)
+            html = env.from_string(_STACK_HTML_TEMPLATE).render(
+                mooring_name=mooring_name,
+                deploy_time=ctx["deploy_time"],
+                recover_time=ctx["recover_time"],
+                n_instr=n_instr,
+                dt_seconds=dt_seconds,
+                n_time=n_time,
+                mooring_report_link=f"{mooring_name}_report.html",
+                grid_exists=grid_exists,
+                instr_rows=instr_rows,
+                var_table=var_table,
+                fig_pressure_b64=fig_pressure_b64,
+                fig_temp_b64=fig_temp_b64,
+                fig_sal_b64=fig_sal_b64,
+                fig_east_vel_b64=fig_east_vel_b64,
+                fig_north_vel_b64=fig_north_vel_b64,
+                fig_up_vel_b64=fig_up_vel_b64,
+                fig_rose_grid_b64=fig_rose_grid_b64,
+                rose_declination_note=rose_declination_note,
+                fig_spacing_b64=fig_spacing_b64,
+                generated=ctx["generated"],
+            )
+            out_path.write_text(html, encoding="utf-8")
+            _status("file", str(out_path.relative_to(self.base_dir)))
+        except Exception as exc:
+            print(f"  ERROR generating stack report: {exc}")
 
     # ------------------------------------------------------------------
     def _build_context(
@@ -1855,6 +3330,7 @@ class MooringReport:
         instruments.sort(key=lambda x: x["hab"])
 
         stack_exists = (proc_dir / f"{mooring_name}_stack.nc").exists()
+        grid_exists = (proc_dir / f"{mooring_name}_grid.nc").exists()
         any_clock = any(i["clock"]["has_correction"] for i in instruments)
 
         def _combined(deploy_key, recover_key, legacy_key):
@@ -1887,6 +3363,7 @@ class MooringReport:
             "n_instruments": len(instruments),
             "instruments": instruments,
             "stack_exists": stack_exists,
+            "grid_exists": grid_exists,
             "any_clock_correction": any_clock,
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "yaml_path": str(yaml_path.relative_to(self.base_dir)),
@@ -1918,15 +3395,18 @@ class MooringReport:
         cruise = _d if _d == _r else f"{_d} / {_r}"
         serial_filter = {_safe_serial(s) for s in serials} if serials else None
 
+        idx = 0
         for instr in instruments:
             serial = instr["serial"]
             if serial_filter and serial not in serial_filter:
                 continue
             instr_type = instr["instr_type"]
             out_path = out_dir / f"{mooring_name}_{serial}_report.html"
+            prefix = f"  [{idx:2d}] {instr_type:<12} s/n {serial:<12}"
+            idx += 1
 
             if out_path.exists() and not force:
-                print(f"  SKIP (exists): {out_path.name}")
+                print(f"{prefix}  {out_path.name}  [exists]")
                 continue
 
             # Best NC for figures (stage3 preferred)
@@ -1986,6 +3466,7 @@ class MooringReport:
                     _make_window_fig(best_nc, instr_type, "end") if best_nc else None
                 ),
                 "fig_tsd_b64": _make_ts_diagram(best_nc) if best_nc else None,
+                "fig_rose_b64": _make_instrument_rose_b64(best_nc) if best_nc else None,
                 "fig_dt_b64": _make_data_histogram(best_nc) if best_nc else None,
                 "qc_summary": _read_qc_summary(stage3_nc) if stage3_nc else [],
                 "nc_meta": _read_nc_metadata(best_nc) if best_nc else {},
@@ -1997,6 +3478,6 @@ class MooringReport:
                 env = Environment(autoescape=True)
                 html = env.from_string(_INSTRUMENT_HTML_TEMPLATE).render(**ctx)
                 out_path.write_text(html, encoding="utf-8")
-                print(f"  Written: {out_path.name}")
+                print(f"{prefix}  {out_path.name}")
             except Exception as exc:
-                print(f"  ERROR writing {out_path.name}: {exc}")
+                print(f"{prefix}  ERROR: {exc}")
